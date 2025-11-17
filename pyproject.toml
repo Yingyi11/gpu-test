@@ -1,0 +1,15 @@
+[project]
+name = "gpu-test"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.10.7",
+    "numpy>=2.2.6",
+    "pandas>=2.3.3",
+    "pynvml>=13.0.1",
+    "swanlab>=0.7.1",
+    "torch>=2.9.0",
+    "torchvision>=0.24.0",
+]
