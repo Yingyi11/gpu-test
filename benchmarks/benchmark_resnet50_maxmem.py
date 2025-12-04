@@ -306,8 +306,9 @@ def benchmark(args):
     criterion = nn.CrossEntropyLoss().to(device)
     
     # 创建数据集和数据加载器
-    # 对于分布式训练,需要确保有足够的数据供所有 GPU 使用
-    dataset_size = args.iterations * args.batch_size * world_size
+    # 使用较小的数据集大小，配合循环使用
+    # 注意：不需要 iterations * batch_size，只需要足够的数据让 DataLoader 循环
+    dataset_size = max(10000, args.batch_size * world_size * 100)  # 足够循环使用
     dataset = SyntheticDataset(size=dataset_size)
     
     if world_size > 1:
@@ -318,14 +319,14 @@ def benchmark(args):
             dataset, batch_size=args.batch_size, sampler=sampler,
             num_workers=args.workers, pin_memory=True,
             persistent_workers=True if args.workers > 0 else False,  # 保持 workers 存活
-            prefetch_factor=4 if args.workers > 0 else None  # 预取更多批次
+            prefetch_factor=2 if args.workers > 0 else None  # 减少预取以节省内存
         )
     else:
         dataloader = DataLoader(
             dataset, batch_size=args.batch_size, shuffle=False,
             num_workers=args.workers, pin_memory=True,
             persistent_workers=True if args.workers > 0 else False,
-            prefetch_factor=4 if args.workers > 0 else None
+            prefetch_factor=2 if args.workers > 0 else None  # 减少预取以节省内存
         )
     
     # 混合精度训练
@@ -391,57 +392,62 @@ def benchmark(args):
     
     start_time = time.time()
     
-    for i, (images, labels) in enumerate(dataloader):
-        if i >= args.iterations:
-            break
-        
-        iter_start = time.time()
-        
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        
-        optimizer.zero_grad()
-        
-        if args.amp:
-            with torch.cuda.amp.autocast():
+    # 使用无限循环迭代器，因为数据集可能比迭代次数小
+    iteration = 0
+    while iteration < args.iterations:
+        for images, labels in dataloader:
+            if iteration >= args.iterations:
+                break
+            
+            iter_start = time.time()
+            
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            
+            optimizer.zero_grad()
+            
+            if args.amp:
+                with torch.cuda.amp.autocast():
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
                 outputs = model(images)
                 loss = criterion(outputs, labels)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-        
-        torch.cuda.synchronize()
-        iter_time = time.time() - iter_start
-        
-        # 计算吞吐量
-        throughput = (args.batch_size * world_size) / iter_time
-        
-        times.append(iter_time)
-        throughputs.append(throughput)
-        losses.append(loss.item())
-        
-        # 上传训练指标到 SwanLab
-        if rank == 0 and SWANLAB_AVAILABLE and args.enable_swanlab:
-            swanlab.log({
-                'train/loss': loss.item(),
-                'train/throughput': throughput,
-                'train/iter_time_ms': iter_time * 1000,
-                'train/step': i + 1,
-            })
-        
-        if rank == 0 and (i + 1) % 10 == 0:
-            avg_throughput = sum(throughputs[-10:]) / len(throughputs[-10:])
-            avg_loss = sum(losses[-10:]) / len(losses[-10:])
-            print(f"[Iter {i+1:4d}/{args.iterations}] "
-                  f"Loss: {avg_loss:.4f} | "
-                  f"Time: {iter_time*1000:.1f}ms | "
-                  f"Throughput: {throughput:.1f} imgs/s | "
-                  f"Avg(last 10): {avg_throughput:.1f} imgs/s")
+                loss.backward()
+                optimizer.step()
+            
+            torch.cuda.synchronize()
+            iter_time = time.time() - iter_start
+            
+            # 计算吞吐量
+            throughput = (args.batch_size * world_size) / iter_time
+            
+            times.append(iter_time)
+            throughputs.append(throughput)
+            losses.append(loss.item())
+            
+            # 上传训练指标到 SwanLab
+            if rank == 0 and SWANLAB_AVAILABLE and args.enable_swanlab:
+                swanlab.log({
+                    'train/loss': loss.item(),
+                    'train/throughput': throughput,
+                    'train/iter_time_ms': iter_time * 1000,
+                    'train/step': iteration + 1,
+                })
+            
+            if rank == 0 and (iteration + 1) % 10 == 0:
+                avg_throughput = sum(throughputs[-10:]) / len(throughputs[-10:])
+                avg_loss = sum(losses[-10:]) / len(losses[-10:])
+                print(f"[Iter {iteration+1:4d}/{args.iterations}] "
+                      f"Loss: {avg_loss:.4f} | "
+                      f"Time: {iter_time*1000:.1f}ms | "
+                      f"Throughput: {throughput:.1f} imgs/s | "
+                      f"Avg(last 10): {avg_throughput:.1f} imgs/s")
+            
+            iteration += 1
     
     total_time = time.time() - start_time
     
@@ -514,8 +520,8 @@ def main():
                         help='模型名称')
     
     # 训练参数
-    parser.add_argument('--batch-size', type=int, default=256,
-                        help='每 GPU 的批次大小 (默认256以最大化显存使用)')
+    parser.add_argument('--batch-size', type=int, default=128,
+                        help='每 GPU 的批次大小 (默认128以避免 OOM)')
     parser.add_argument('--iterations', type=int, default=100,
                         help='测试迭代次数')
     parser.add_argument('--warmup', type=int, default=10,
